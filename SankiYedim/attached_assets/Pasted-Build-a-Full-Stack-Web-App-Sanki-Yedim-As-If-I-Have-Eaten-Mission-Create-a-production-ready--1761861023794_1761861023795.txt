@@ -1,0 +1,448 @@
+Build a Full-Stack Web App: Sanki Yedim (“As If I Have Eaten”)
+
+Mission: Create a production-ready, full-stack web app where users log things they would have bought (e.g., coffee, chocolate) and treat those as savings. After adding an entry, the app offers to move the same amount into savings—via a Manual Transfer Checklist (default, Canada-friendly) or a Plaid Sandbox simulation (demo only). The theme is inspired by the “Sanki Yedim Camii” story (small daily discipline → meaningful impact).
+Inspiration text: “Sanki Yedim Camii” (for /about page). Summarize tastefully; no plagiarism. Original story link for your reference only: https://iqranetwork.com/blog/the-story-of-the-turkish-mosqueas-if-i-have-eaten/
+
+Stack & Key Libraries (keep it simple, batteries included)
+
+Runtime/App: Next.js 14+ (App Router) + TypeScript
+
+UI/UX: Chakra UI (easy, accessible components) with a light custom theme (warm neutrals + subtle Turkish tile motif)
+
+Auth: NextAuth.js with Google and Email magic link providers
+
+DB/ORM: Prisma + SQLite (dev) and Postgres (prod)
+
+Validation: Zod (server & client)
+
+Data fetching/state: Server Actions where natural; React Query for lists/mutations
+
+Charts: Lightweight canvas sparkline (no heavy chart lib)
+
+Testing: Vitest (unit), Playwright (e2e)
+
+Misc: ESLint + Prettier, rate-limiting on POSTs
+
+High-Level Features
+
+Auth & Accounts
+
+Sign in/up with Google; fallback: email magic link
+
+Protected app area under /app/*
+
+/app/settings: profile (name), email (read-only if OAuth), monthly & yearly goals, preferred Bank Provider + labels/IDs
+
+Delete account (with explicit confirm)
+
+Dashboard (/app/dashboard)
+
+Quick-add form: { item, amount, category?, note?, date(default now) }
+
+KPIs: Total Saved, Saved This Month, Streak, Goal Progress (monthly & yearly)
+
+Sparkline of savings for the last 30 days
+
+After entry submit → toast: “Saved $X — Move funds now?” with action
+
+Entries (/app/entries)
+
+Paginated table, filters (date range, category), search by text
+
+Edit/delete rows, bulk select → Create Transfer (bundle)
+
+Transfers (/app/transfers)
+
+List of transfer groups with status: pending_manual | scheduled | completed | failed
+
+Manual provider: Transfer Checklist Modal (copyable amount/memo + step-by-step); “Mark Completed” to update status
+
+Plaid Sandbox provider: fake/simulated link, list “from/to” accounts, schedule & complete simulated transfer
+
+About (/about)
+
+Short, uplifting 2–3 paragraph retelling of Sanki Yedim Camii and how micro-savings build macro-impact
+
+Marketing Home (/)
+
+Lightweight splash with brand/story, CTA → Sign in
+
+Domain Model (Prisma)
+
+Implement the schema below exactly; run migration & seed:
+
+model User {
+  id          String      @id @default(cuid())
+  email       String      @unique
+  name        String?
+  image       String?
+  createdAt   DateTime    @default(now())
+  entries     Entry[]
+  transfers   Transfer[]
+  preferences Preference?
+}
+
+model Entry {
+  id         String   @id @default(cuid())
+  userId     String
+  item       String
+  amount     Decimal  @db.Decimal(10,2)
+  category   String?
+  note       String?
+  date       DateTime @default(now()) // logical “spend” date
+  createdAt  DateTime @default(now())
+  transferId String?
+  user       User     @relation(fields: [userId], references: [id])
+  transfer   Transfer? @relation(fields: [transferId], references: [id])
+}
+
+model Transfer {
+  id          String   @id @default(cuid())
+  userId      String
+  totalAmount Decimal  @db.Decimal(10,2)
+  method      String   // "manual" | "plaid_sandbox"
+  status      String   // "pending_manual" | "scheduled" | "completed" | "failed"
+  createdAt   DateTime @default(now())
+  completedAt DateTime?
+  entries     Entry[]
+  user        User     @relation(fields: [userId], references: [id])
+}
+
+model Preference {
+  id               String  @id @default(cuid())
+  userId           String  @unique
+  bankProvider     String  @default("manual") // "manual" | "plaid_sandbox"
+  fromAccountLabel String?
+  toAccountLabel   String?
+  plaidItemId      String?
+  plaidFromId      String?
+  plaidToId        String?
+  monthlyGoal      Decimal @db.Decimal(10,2) @default(0.00)
+  yearlyGoal       Decimal @db.Decimal(10,2) @default(0.00)
+  user             User    @relation(fields: [userId], references: [id])
+}
+
+API Contract (App Router Route Handlers)
+
+All responses JSON with standard error shape { error: { code, message, details? } }. Validate request bodies with Zod.
+
+POST /api/entries
+Body: { item: string, amount: number|string, category?: string, note?: string, date?: string }
+Auth required → creates Entry (amount as Decimal), returns entry
+
+GET /api/entries?from=&to=&category=&q=&page=&pageSize=
+Lists user entries (paginated)
+
+PATCH /api/entries/:id
+Partial update
+
+DELETE /api/entries/:id
+
+POST /api/transfers
+Body: { entryIds: string[] } → groups entries into a Transfer using active provider; sets pending_manual or scheduled
+
+GET /api/transfers?page=&pageSize=
+
+POST /api/settings/provider
+Body: { provider: "manual" | "plaid_sandbox", fromAccountLabel?, toAccountLabel?, plaidFromId?, plaidToId? }
+
+POST /api/bank/link (plaid sandbox only) → returns mock link token, stores plaidItemId
+
+GET /api/bank/accounts (plaid sandbox only) → returns mock accounts & balances
+
+(Optional) POST /api/transfers/:id/complete to mark manual as completed
+
+Auth guards: All /api/* (except auth endpoints) require an authenticated user and must scope queries by userId.
+
+Banking Abstraction
+
+Create IBankProvider interface and two implementations:
+
+export interface IBankProvider {
+  getDisplayName(): string;
+  getCapabilities(): { simulateTransfers: boolean; manualChecklist: boolean };
+  listAccounts(userId: string): Promise<Array<{ id: string; name: string; balance?: number }>>;
+  createTransfer(args: {
+    userId: string;
+    entryIds: string[];
+    totalAmount: number;
+  }): Promise<{ transferId: string; status: "pending_manual" | "scheduled" }>;
+  markCompleted?(transferId: string): Promise<void>;
+}
+
+
+ManualTransferProvider (default):
+
+simulateTransfers=false, manualChecklist=true
+
+createTransfer → pending_manual and return checklist data (UI builds modal)
+
+Provide memo suggestion: Sanki Yedim – {YYYY-MM-DD} – {n} items
+
+markCompleted sets status to completed
+
+PlaidSandboxProvider (demo only):
+
+simulateTransfers=true, manualChecklist=false
+
+Provide mock account listing (e.g., “Checking (…1234)”, “Savings (…5678)”) and fake balances
+
+createTransfer → scheduled and auto-flip to completed after a short timeout (server side) or via explicit endpoint
+
+Select provider by env: BANK_PROVIDER=manual | plaid_sandbox and saved user preferences.
+
+UI/UX & Pages
+
+Use Chakra UI for all components (Button, Input, FormControl, Modal, Table, Stat, Progress, Tabs/Accordion).
+
+Theme
+
+Warm neutral background, soft shadow cards, rounded corners
+
+Accent color for actions; subtle geometric “tile” SVG as a faint header/footer background
+
+Display font for headings (serif), system sans for body
+
+Pages
+
+/ – Landing: headline, microcopy about the story, CTA buttons: “Sign in with Google” + email option
+
+/about – Story page (2–3 paragraphs, tasteful summary; attribute inspiration without copying)
+
+/app/dashboard
+
+Left: Quick-Add Entry form
+
+Right: KPI cards (Total Saved, This Month, Streak, Goal Progress x2) + sparkline
+
+After submit → Toast “Saved $X — Move funds now?” → if yes: create transfer with current provider
+
+/app/entries
+
+Table with filters (date range picker, category select), search box, pagination
+
+Row actions: edit, delete
+
+Bulk select → “Create Transfer”
+
+/app/transfers
+
+Cards/table: status, totalAmount, count of entries, createdAt, completedAt
+
+For manual: Checklist Modal (copy buttons for Amount, Memo, From, To); “Mark Completed”
+
+/app/settings
+
+Profile: name; email read-only; avatar if available from Google
+
+Goals: monthly & yearly (Decimal, >= 0)
+
+Provider: radio/select (manual default, plaid_sandbox optional)
+
+Manual labels: from/to account labels
+
+Plaid (sandbox): fake link/connect flow + choose from/to account IDs
+
+Accessibility: All inputs labeled; keyboard navigable; aria attributes; focus ring; high-contrast text.
+
+Business Logic
+
+Streak: any calendar day with ≥1 entry = 1; streak breaks with 0 entries on a day
+
+Totals: sum of Entry.amount; when entries are included in a Transfer, show that as “moved” tally (derived by status)
+
+Goals: show progress bars for month & year (saved amounts ÷ goals)
+
+Currency: store with Prisma Decimal; present with 2 dp; no float math
+
+Frontend Types & Validation
+
+Create a shared schema.ts with Zod:
+
+export const EntryCreateSchema = z.object({
+  item: z.string().min(1).max(120),
+  amount: z.coerce.number().positive().finite(),
+  category: z.string().optional(),
+  note: z.string().max(500).optional(),
+  date: z.coerce.date().optional(),
+});
+export const TransferCreateSchema = z.object({
+  entryIds: z.array(z.string().cuid()).min(1),
+});
+export const ProviderSchema = z.object({
+  provider: z.enum(["manual", "plaid_sandbox"]),
+  fromAccountLabel: z.string().optional(),
+  toAccountLabel: z.string().optional(),
+  plaidFromId: z.string().optional(),
+  plaidToId: z.string().optional(),
+});
+
+
+Use these on server and client.
+
+File/Folder Structure
+/app
+  /(public)
+  /api
+    /entries/route.ts
+    /entries/[id]/route.ts
+    /transfers/route.ts
+    /transfers/[id]/complete/route.ts
+    /settings/provider/route.ts
+    /bank/link/route.ts
+    /bank/accounts/route.ts
+  /(marketing)/page.tsx
+  /about/page.tsx
+  /app/dashboard/page.tsx
+  /app/entries/page.tsx
+  /app/transfers/page.tsx
+  /app/settings/page.tsx
+/components
+  EntryForm.tsx
+  KpiCard.tsx
+  Sparkline.tsx
+  TransferChecklistModal.tsx
+  ProviderSelector.tsx
+  DataTable.tsx
+/lib
+  auth.ts          // NextAuth config
+  prisma.ts        // Prisma client
+  rateLimit.ts
+  zod-schemas.ts
+  bank/index.ts    // IBankProvider, provider registry
+  bank/manual.ts   // ManualTransferProvider
+  bank/plaidSandbox.ts
+/styles
+  theme.ts         // Chakra theme (colors, fonts, components)
+/prisma
+  schema.prisma
+  seed.ts
+/tests
+  unit/*.test.ts
+  e2e/*.spec.ts
+.env.local.example
+README.md
+
+Auth (NextAuth)
+
+Providers: Google OAuth (profile, email), Email (magic link via SMTP or Resend)
+
+Session strategy: JWT or database (your choice; prefer JWT for simplicity)
+
+Expose auth() utility & getServerSession() wrappers
+
+Protect /app/* via middleware or server components that gate by session
+
+Environment & Config
+
+Create .env.local with placeholders (and document in README):
+
+DATABASE_URL="file:./dev.db"
+NEXTAUTH_URL="http://localhost:3000"
+NEXTAUTH_SECRET="replace_me"
+
+# Email magic link (choose one)
+EMAIL_SERVER_HOST="smtp.example.com"
+EMAIL_SERVER_PORT="587"
+EMAIL_SERVER_USER="user"
+EMAIL_SERVER_PASSWORD="pass"
+EMAIL_FROM="no-reply@sankiyedim.app"
+
+# Google OAuth
+GOOGLE_CLIENT_ID=""
+GOOGLE_CLIENT_SECRET=""
+
+# Optional Plaid sandbox (demo only)
+PLAID_CLIENT_ID=""
+PLAID_SECRET=""
+PLAID_ENV="sandbox"
+
+# Provider selection
+BANK_PROVIDER="manual"   # or "plaid_sandbox"
+
+
+Dev init commands:
+
+npm i
+
+npx prisma migrate dev
+
+npx prisma db seed
+
+npm run dev
+
+Security & Compliance Notes
+
+No real money movement in MVP; Plaid path is sandbox/simulated only
+
+Rate-limit create/update/delete routes; CSRF protection on POSTs
+
+Log errors without secrets; do not log tokens
+
+Multi-tenant isolation by userId in every DB query
+
+Validate all inputs with Zod; return typed errors
+
+Testing (generate these)
+
+Unit (Vitest):
+
+Streak calculation over sample calendars
+
+Decimal math helpers for totals & goals
+
+Provider factory returns correct flags
+
+e2e (Playwright):
+
+Sign in (mock Google in CI) → create 3 entries → bulk transfer (manual) → mark completed → dashboard totals update
+
+Seed & Demo
+
+prisma/seed.ts: create demo user with a handful of entries (coffee/chocolate), monthly/yearly goals, provider=manual
+
+Dev-only “Try Demo” button to auto-sign as demo user (guard out of production)
+
+UX Copy Hints
+
+Dashboard headline: “Little choices. Big results.”
+
+Empty states with gentle prompts (e.g., “Log your first ‘as-if purchase’”)
+
+After transfer created (manual): “Great! Move the funds in your banking app, then mark as completed.”
+
+Acceptance Criteria (must be true)
+
+App runs locally on Replit with Chakra UI theme, protected /app/*, working Auth (Google + Email)
+
+Can create/list/edit/delete Entries
+
+Dashboard shows KPIs, sparkline, streak, goal progress
+
+Can select multiple entries and create a Transfer, with provider-correct behavior
+
+Manual Transfer Checklist works; “Mark Completed” updates status
+
+Plaid Sandbox path is clearly labeled as demo and simulates accounts/transfers
+
+/about includes tasteful retelling of the Sanki Yedim story
+
+README documents setup, env vars, limitations (esp. banking), how to switch providers
+
+What to Generate Now
+
+All source files per structure above (pages, API handlers, components, providers)
+
+Prisma schema + migrations + seed
+
+NextAuth config (Google + Email)
+
+Chakra theme with basic brand tokens and subtle tile background SVG
+
+Zod schemas + server validation usage
+
+Unit & e2e test scaffolding
+
+README and .env.local.example
+
+Build it cleanly with TypeScript, consistent imports, and descriptive component/prop naming. Favor simplicity and readability over cleverness.
